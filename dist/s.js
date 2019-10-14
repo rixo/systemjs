@@ -106,8 +106,20 @@
   }
 
   /*
+   * Import maps implementation
+   *
+   * To make lookups fast we pre-resolve the entire import map
+   * and then match based on backtracked hash lookups
+   *
+   */
+
+  function resolveUrl (relUrl, parentUrl) {
+    return resolveIfNotPlainOrUrl(relUrl, parentUrl) || (relUrl.indexOf(':') !== -1 ? relUrl : resolveIfNotPlainOrUrl('./' + relUrl, parentUrl));
+  }
+
+  /*
    * SystemJS Core
-   * 
+   *
    * Provides
    * - System.import
    * - System.register support for
@@ -117,7 +129,7 @@
    * - Symbol.toStringTag support in Module objects
    * - Hookable System.createContext to customize import.meta
    * - System.onload(err, id, deps) handler for tracing / hot-reloading
-   * 
+   *
    * Core comes with no System.prototype.resolve or
    * System.prototype.instantiate implementations
    */
@@ -176,7 +188,7 @@
     const ns = Object.create(null);
     if (toStringTag)
       Object.defineProperty(ns, toStringTag, { value: 'Module' });
-    
+
     let instantiatePromise = Promise.resolve()
     .then(function () {
       return loader.instantiate(id, firstParentUrl);
@@ -270,7 +282,7 @@
       d: undefined,
       // execution function
       // set to NULL immediately after execution (or on any failure) to indicate execution has happened
-      // in such a case, pC should be used, and pLo, pLi will be emptied
+      // in such a case, C should be used, and E, I, L will be emptied
       e: undefined,
 
       // On execution we have populated:
@@ -279,7 +291,7 @@
       // in the case of TLA, the execution promise
       E: undefined,
 
-      // On execution, pLi, pLo, e cleared
+      // On execution, L, I, E cleared
 
       // Promise for top-level completion
       C: undefined
@@ -412,6 +424,19 @@
       document.head.appendChild(script);
     });
   };
+
+  if (hasDocument) {
+    window.addEventListener('DOMContentLoaded', loadScriptModules);
+    loadScriptModules();
+  }
+
+  function loadScriptModules() {
+    document.querySelectorAll('script[type=systemjs-module]').forEach(function (script) {
+      if (script.src) {
+        System.import(script.src.slice(0, 7) === 'import:' ? script.src.slice(7) : resolveUrl(script.src, baseUrl));
+      }
+    });
+  }
 
   /*
    * Supports loading System.register in workers

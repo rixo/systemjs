@@ -191,7 +191,7 @@
 
   /*
    * SystemJS Core
-   * 
+   *
    * Provides
    * - System.import
    * - System.register support for
@@ -201,7 +201,7 @@
    * - Symbol.toStringTag support in Module objects
    * - Hookable System.createContext to customize import.meta
    * - System.onload(err, id, deps) handler for tracing / hot-reloading
-   * 
+   *
    * Core comes with no System.prototype.resolve or
    * System.prototype.instantiate implementations
    */
@@ -271,7 +271,7 @@
     const ns = Object.create(null);
     if (toStringTag)
       Object.defineProperty(ns, toStringTag, { value: 'Module' });
-    
+
     let instantiatePromise = Promise.resolve()
     .then(function () {
       return loader.instantiate(id, firstParentUrl);
@@ -369,7 +369,7 @@
       d: undefined,
       // execution function
       // set to NULL immediately after execution (or on any failure) to indicate execution has happened
-      // in such a case, pC should be used, and pLo, pLi will be emptied
+      // in such a case, C should be used, and E, I, L will be emptied
       e: undefined,
 
       // On execution we have populated:
@@ -378,7 +378,7 @@
       // in the case of TLA, the execution promise
       E: undefined,
 
-      // On execution, pLi, pLo, e cleared
+      // On execution, L, I, E cleared
 
       // Promise for top-level completion
       C: undefined
@@ -526,6 +526,19 @@
     });
   };
 
+  if (hasDocument) {
+    window.addEventListener('DOMContentLoaded', loadScriptModules);
+    loadScriptModules();
+  }
+
+  function loadScriptModules() {
+    document.querySelectorAll('script[type=systemjs-module]').forEach(function (script) {
+      if (script.src) {
+        System.import(script.src.slice(0, 7) === 'import:' ? script.src.slice(7) : resolveUrl(script.src, baseUrl));
+      }
+    });
+  }
+
   /*
    * Supports loading System.register in workers
    */
@@ -589,9 +602,9 @@
   }
 
   const impt = systemJSPrototype.import;
-  systemJSPrototype.import = function (id, parentUrl) {
+  systemJSPrototype.import = function () {
     noteGlobalProps();
-    return impt.call(this, id, parentUrl);
+    return impt.apply(this, arguments);
   };
 
   const emptyInstantiation = [[], function () { return {} }];
@@ -601,7 +614,7 @@
     const lastRegister = getRegister.call(this);
     if (lastRegister)
       return lastRegister;
-    
+
     // no registration -> attempt a global detection as difference from snapshot
     // when multiple globals, we take the global value to be the last defined new global object property
     // for performance, this will not support multi-version / global collisions as previous SystemJS versions did
@@ -609,7 +622,7 @@
     const globalProp = getGlobalProp();
     if (!globalProp)
       return emptyInstantiation;
-    
+
     let globalExport;
     try {
       globalExport = global[globalProp];
@@ -780,6 +793,10 @@
     }
   };
 
+  systemJSPrototype.getLoad = function (id) {
+    return this[REGISTRY][id];
+  };
+
   systemJSPrototype.set = function (id, module) {
     let ns;
     if (toStringTag$1 && module[toStringTag$1] === 'Module') {
@@ -790,43 +807,67 @@
       if (toStringTag$1)
         Object.defineProperty(ns, toStringTag$1, { value: 'Module' });
     }
+
     const done = Promise.resolve(ns);
-    this.delete(id);
-    this[REGISTRY][id] = {
+
+    const load = this[REGISTRY][id] || (this[REGISTRY][id] = {
       id: id,
       i: [],
-      n: ns,
-      I: done,
-      L: done,
       h: false,
       d: [],
       e: null,
       er: undefined,
-      E: undefined,
+      E: undefined
+    });
+
+    if (load.e || load.E)
+      return false;
+
+    Object.assign(load, {
+      n: ns,
+      I: done,
+      L: done,
       C: done
-    };
+    });
     return ns;
   };
 
   systemJSPrototype.has = function (id) {
     const load = this[REGISTRY][id];
-    return load && load.e === null && !load.E;
+    return !!load;
   };
 
   // Delete function provided for hot-reloading use cases
   systemJSPrototype.delete = function (id) {
-    const load = this.get(id);
-    if (load === undefined)
+    const registry = this[REGISTRY];
+    const load = registry[id];
+    // in future we can support load.E case by failing load first
+    // but that will require TLA callbacks to be implemented
+    if (!load || load.e !== null || load.E)
       return false;
+
+    let importerSetters = load.i;
     // remove from importerSetters
     // (release for gc)
-    if (load && load.d)
+    if (load.d)
       load.d.forEach(function (depLoad) {
         const importerIndex = depLoad.i.indexOf(load);
         if (importerIndex !== -1)
           depLoad.i.splice(importerIndex, 1);
       });
-    return delete this[REGISTRY][id];
+    delete registry[id];
+    return function () {
+      const load = registry[id];
+      if (!load || !importerSetters || load.e !== null || load.E)
+        return false;
+
+      // add back the old setters
+      importerSetters.forEach(setter => {
+        load.i.push(setter);
+        setter(load.n);
+      });
+      importerSetters = null;
+    };
   };
 
   const iterator = typeof Symbol !== 'undefined' && Symbol.iterator;
@@ -837,7 +878,7 @@
     const result = {
       next: function () {
         while (
-          (key = keys[index++]) !== undefined && 
+          (key = keys[index++]) !== undefined &&
           (ns = loader.get(key)) === undefined
         );
         return {
@@ -851,5 +892,58 @@
 
     return result;
   };
+
+  (function () {
+    const systemJSPrototype = System.constructor.prototype;
+    const lastUpdateFunction = {};
+
+    systemJSPrototype.reload = function (id, parentUrl) {
+      const loader = this;
+
+      // System.import resolves the url before setting up the loading state
+      // doing the same here ensures we don't run into race conditions
+      return Promise.resolve()
+        .then(function () {
+          return loader.resolve(id, parentUrl);
+        })
+        .then(function (id) {
+          if (!loader.has(id)) {
+            // module was not loaded before
+            return loader.import(id);
+          }
+
+          // import the module to ensure that the current module is full loaded
+          return loader.import(id)
+            .catch(function () {
+              // don't handle errors from the previous import, they might be fixed in the reload
+            })
+            .then(function () {
+              // delete the module from the registry, re-import it and
+              // update the references in the registry
+              const update = loader.delete(id);
+
+              function onResolved() {
+                if (update) {
+                  update();
+                } else if (id in lastUpdateFunction) {
+                  lastUpdateFunction[id]();
+                }
+
+                lastUpdateFunction[id] = update;
+              }
+              return loader.import(id)
+                .catch(function (error) {
+                  onResolved();
+                  throw error;
+                })
+                .then(function (module) {
+                  onResolved();
+                  return module;
+                });
+            });
+        });
+    };
+
+  })();
 
 }());
